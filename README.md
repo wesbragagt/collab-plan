@@ -21,3 +21,11 @@ Other flags: `-name`, `-listen`, `-agent CMD` (feed peer chat to a local process
 ## Security
 
 The tunnel is plain TCP and the token is sent in clear text. Run it over Tailscale or an SSH forward, not the open internet.
+
+## Nix
+
+Run without installing:
+
+    nix run github:wesbragagt/collab-plan -- host
+
+Or add it to a shell: `nix shell github:wesbragagt/collab-plan`. `nix develop` gives a Go dev shell.
