@@ -12,7 +12,7 @@ Two-person TCP tunnel for a shared planning session between two people and their
    It prints a link (`collab-plan://HOST:PORT/TOKEN`) and a prompt to send to the peer.
    `HOST` defaults to the Tailscale IP, else the first LAN IP. Override with `-advertise`.
 2. Peer pastes the prompt into their Claude session. Claude runs `collab-plan join <link> -fifo ... -log ...`.
-3. Send messages by writing to the fifo, read the peer from the log.
+3. Send messages by writing to the fifo. Read the peer with `collab-plan next -log FILE -name N`: it blocks until new peer lines arrive, prints them and exits, so an agent can run it as a background task and be woken by it.
    `/decide <text>` records a decision on both sides. `/quit` ends the session.
 4. When the session ends the tunnel closes and each side writes `plan-<timestamp>.md` (override with `-out`) with the participants and decisions.
 

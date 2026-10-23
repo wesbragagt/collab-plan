@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -83,6 +84,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage:
   collab-plan host [-listen :7777] [-advertise HOST] [-name N] [-agent CMD] [-fifo PIPE] [-log FILE]
   collab-plan join collab-plan://HOST:PORT/TOKEN [-name N] [-agent CMD] [-fifo PIPE] [-log FILE]
+  collab-plan next -log FILE -name N [-timeout 10m]   (block until new peer lines)
 
 host prints a link and a paste-ready prompt; the peer pastes it into their
 Claude session. Lines typed on stdin or written to -fifo go to the peer.
@@ -97,6 +99,10 @@ func main() {
 		usage()
 	}
 	cmd := os.Args[1]
+	if cmd == "next" {
+		runNext(os.Args[2:])
+		return
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	name := fs.String("name", defaultName(), "display name")
 	agentCmd := fs.String("agent", "", "local agent command (run via sh -c)")
@@ -325,6 +331,56 @@ func parseLink(link string) (addr, tok string, err error) {
 	return u.Host, tok, nil
 }
 
+// runNext blocks until the log has new lines from the peer, prints them, and
+// exits. The read position is kept in <log>.cursor so each call returns only
+// unseen lines. It is meant to be run by an agent as a background task: the
+// task finishing is what wakes the agent up.
+func runNext(args []string) {
+	fs := flag.NewFlagSet("next", flag.ExitOnError)
+	logPath := fs.String("log", "", "transcript file written by host/join")
+	name := fs.String("name", defaultName(), "own display name; lines from it are skipped")
+	timeout := fs.Duration("timeout", 10*time.Minute, "give up after this long (exits 0, prints nothing)")
+	fs.Parse(args)
+	if *logPath == "" {
+		fmt.Fprintln(os.Stderr, "error: -log is required")
+		os.Exit(2)
+	}
+	cursor := *logPath + ".cursor"
+	var off int64
+	if b, err := os.ReadFile(cursor); err == nil {
+		fmt.Sscan(string(b), &off)
+	}
+	own := []string{"[" + *name + "] ", "[" + *name + "/agent] "}
+	deadline := time.Now().Add(*timeout)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(*logPath)
+		if err == nil && int64(len(data)) < off {
+			off = 0 // log was truncated or replaced
+		}
+		if err == nil && int64(len(data)) > off {
+			// Only consume complete lines.
+			end := bytes.LastIndexByte(data, '\n') + 1
+			if int64(end) > off {
+				var out strings.Builder
+				for _, l := range strings.SplitAfter(string(data[off:end]), "\n") {
+					// Log lines look like "15:04:05 [name] text".
+					_, rest, _ := strings.Cut(l, " ")
+					if l != "" && !slices.ContainsFunc(own, func(p string) bool { return strings.HasPrefix(rest, p) }) {
+						out.WriteString(l)
+					}
+				}
+				off = int64(end)
+				os.WriteFile(cursor, []byte(fmt.Sprint(off)), 0o644)
+				if out.Len() > 0 {
+					fmt.Print(out.String())
+					return
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 // advertiseIP prefers a Tailscale address (100.64.0.0/10), then any non-loopback IPv4.
 func advertiseIP() string {
 	_, tsNet, _ := net.ParseCIDR("100.64.0.0/10")
@@ -350,7 +406,8 @@ func pastePrompt(link string) string {
 	return fmt.Sprintf(`Join a collaborative planning session with me via the collab-plan CLI.
 1. Run in the background: collab-plan join %s -name <my name> -fifo /tmp/collab-plan.fifo -log /tmp/collab-plan.log
 2. To send my peer a message: echo "text" > /tmp/collab-plan.fifo
-3. Read what my peer says: tail /tmp/collab-plan.log
+3. Read my peer: run in the background: collab-plan next -log /tmp/collab-plan.log -name <my name>
+   It blocks until the peer sends something new, prints only the new lines, then exits. When it exits, read the output, reply if needed, and start it again. Keep exactly one running for the whole session.
 4. When we agree on something, record it: echo "/decide <one-line decision>" > /tmp/collab-plan.fifo
 5. When I say we are done: echo "/quit" > /tmp/collab-plan.fifo. That closes the tunnel and writes the decisions markdown.
 Discuss and refine the plan with the peer's agent; keep me updated on what is agreed.`, link)
