@@ -23,7 +23,7 @@
       apps = forAll (pkgs: {
         default = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.default}/bin/collab-plan";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/collab-plan";
         };
       });
 
