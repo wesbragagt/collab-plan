@@ -1,21 +1,31 @@
-// collab-plan: a two-person TCP tunnel that bridges terminal chat and each
-// person's local agent process for a shared planning session.
+// collab-plan: a TLS tunnel for a shared planning session. One host relays
+// chat, decisions and agent output between any number of joined peers, and
+// every side ends up with a markdown file of the decisions and the transcript.
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"slices"
 	"strings"
 	"sync"
@@ -24,22 +34,76 @@ import (
 )
 
 type msg struct {
-	Kind string `json:"kind"` // chat | agent | decision
+	Kind string `json:"kind"` // hello | chat | agent | decision | sys
 	From string `json:"from"`
 	Text string `json:"text"`
 }
 
+type peer struct {
+	conn net.Conn
+	mu   sync.Mutex // serializes writes to enc
+	enc  *json.Encoder
+	name string
+}
+
+func newPeer(c net.Conn, name string) *peer {
+	return &peer{conn: c, enc: json.NewEncoder(c), name: name}
+}
+
+func (p *peer) send(m msg) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return p.enc.Encode(m)
+}
+
+type entry struct {
+	at   time.Time
+	line string
+}
+
 type session struct {
-	name      string
-	conn      net.Conn
-	enc       *json.Encoder
-	mu        sync.Mutex // guards enc, stdout/log writes, decisions, people
-	log       io.Writer
-	out       io.Writer
-	agent     io.WriteCloser // nil when no local agent
-	start     time.Time
-	people    []string
-	decisions []msg
+	name string
+	hub  bool // host relays messages between peers; a joiner has the host as its only peer
+	ln   net.Listener
+
+	mu         sync.Mutex // guards everything below, plus out/log writes
+	peers      map[*peer]bool
+	people     []string
+	decisions  []msg
+	transcript []entry
+	log        io.Writer
+	out        io.Writer
+
+	agentMu sync.Mutex
+	agent   io.WriteCloser // nil when no local agent
+
+	start time.Time
+	once  sync.Once
+	done  chan struct{}
+}
+
+func (s *session) end() {
+	s.once.Do(func() {
+		close(s.done)
+		if s.ln != nil {
+			s.ln.Close()
+		}
+		s.mu.Lock()
+		for p := range s.peers {
+			p.conn.Close()
+		}
+		s.mu.Unlock()
+	})
+}
+
+func (s *session) ended() bool {
+	select {
+	case <-s.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *session) addPerson(n string) {
@@ -50,31 +114,50 @@ func (s *session) addPerson(n string) {
 	}
 }
 
-func (s *session) send(m msg) error {
+func (s *session) broadcast(m msg, except *peer) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.enc.Encode(m)
+	ps := make([]*peer, 0, len(s.peers))
+	for p := range s.peers {
+		if p != except {
+			ps = append(ps, p)
+		}
+	}
+	s.mu.Unlock()
+	for _, p := range ps {
+		if p.send(m) != nil {
+			p.conn.Close()
+		}
+	}
 }
 
 func (s *session) show(m msg) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tag := m.From
-	if m.Kind == "agent" {
+	switch m.Kind {
+	case "agent":
 		tag += "/agent"
-	}
-	if m.Kind == "decision" {
+	case "decision":
 		s.decisions = append(s.decisions, m)
 		tag += "/decision"
+	case "sys":
+		tag = "*"
 	}
-	line := fmt.Sprintf("[%s] %s\n", tag, m.Text)
-	io.WriteString(s.out, line)
+	if m.Kind != "sys" && !slices.Contains(s.people, m.From) {
+		s.people = append(s.people, m.From)
+	}
+	line := fmt.Sprintf("[%s] %s", tag, m.Text)
+	now := time.Now()
+	s.transcript = append(s.transcript, entry{now, line})
+	fmt.Fprintln(s.out, line)
 	if s.log != nil {
-		fmt.Fprintf(s.log, "%s %s", time.Now().Format("15:04:05"), line)
+		fmt.Fprintf(s.log, "%s %s\n", now.Format("15:04:05"), line)
 	}
 }
 
 func (s *session) toAgent(text string) {
+	s.agentMu.Lock()
+	defer s.agentMu.Unlock()
 	if s.agent != nil {
 		io.WriteString(s.agent, text+"\n")
 	}
@@ -82,14 +165,17 @@ func (s *session) toAgent(text string) {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage:
-  collab-plan host [-listen :7777] [-advertise HOST] [-name N] [-agent CMD] [-fifo PIPE] [-log FILE]
-  collab-plan join collab-plan://HOST:PORT/TOKEN [-name N] [-agent CMD] [-fifo PIPE] [-log FILE]
+  collab-plan host [-listen :7777] [-advertise HOST] [-name N] [-agent CMD] [-fifo PIPE] [-log FILE] [-out FILE]
+  collab-plan join collab-plan://HOST:PORT/TOKEN/FINGERPRINT [-name N] [-agent CMD] [-fifo PIPE] [-log FILE] [-out FILE]
   collab-plan next -log FILE -name N [-timeout 10m]   (block until new peer lines)
 
-host prints a link and a paste-ready prompt; the peer pastes it into their
-Claude session. Lines typed on stdin or written to -fifo go to the peer.
-With -agent CMD, remote chat is fed to CMD and CMD's stdout is shared.
-/quit leaves. Across NAT use tailscale or "ssh -R 7777:localhost:7777 server".
+host prints a link and a paste-ready prompt. Any number of peers can paste it
+into their Claude session and join. The connection is TLS; the link carries the
+host certificate fingerprint, which joiners pin.
+Lines typed on stdin or written to -fifo go to everyone. "/decide TEXT" records
+a decision, "/quit" leaves. When the host quits the tunnel closes for everyone.
+Each side then writes a markdown file with the decisions and the transcript.
+With -agent CMD, chat is fed to CMD and CMD's stdout is shared.
 `)
 	os.Exit(2)
 }
@@ -110,73 +196,100 @@ func main() {
 	listen := fs.String("listen", ":7777", "host: listen address")
 	advertise := fs.String("advertise", "", "host: host/IP put in the link (default: Tailscale IP, else first LAN IP)")
 	fifo := fs.String("fifo", "", "read outgoing lines from this named pipe (for agents: echo text > FIFO)")
-	out := fs.String("out", "", "decisions markdown path (default plan-<timestamp>.md)")
+	out := fs.String("out", "", "summary markdown path (default plan-<timestamp>.md)")
 
 	var link string
 	args := os.Args[2:]
-	if cmd == "join" {
+	switch cmd {
+	case "host":
+	case "join":
 		if len(args) < 1 {
 			usage()
 		}
 		link, args = args[0], args[1:]
-	}
-	fs.Parse(args)
-
-	var conn net.Conn
-	var err error
-	switch cmd {
-	case "host":
-		conn, err = host(*listen, *advertise)
-	case "join":
-		var addr, tok string
-		addr, tok, err = parseLink(link)
-		if err == nil {
-			conn, err = join(addr, tok)
-		}
 	default:
 		usage()
 	}
-	if err != nil {
+	fs.Parse(args)
+
+	s := &session{
+		name:   *name,
+		hub:    cmd == "host",
+		peers:  map[*peer]bool{},
+		people: []string{*name},
+		out:    os.Stdout,
+		start:  time.Now(),
+		done:   make(chan struct{}),
+	}
+	fail := func(err error) {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-	defer conn.Close()
-
-	s := &session{name: *name, conn: conn, enc: json.NewEncoder(conn), out: os.Stdout, start: time.Now(), people: []string{*name}}
 	if *logFile != "" {
 		f, err := os.OpenFile(*logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
+			fail(err)
 		}
 		defer f.Close()
 		s.log = f
 	}
 	if *agentCmd != "" {
 		if err := s.startAgent(*agentCmd); err != nil {
-			fmt.Fprintln(os.Stderr, "error: agent:", err)
-			os.Exit(1)
+			fail(fmt.Errorf("agent: %w", err))
 		}
 	}
 
-	done := make(chan struct{})
-	go func() { s.readRemote(); close(done) }()
+	// Start the network side last so no message arrives before the agent and log are ready.
+	var run func()
+	if s.hub {
+		cfg, fp, tok, err := serverTLS()
+		if err != nil {
+			fail(err)
+		}
+		ln, err := tls.Listen("tcp", *listen, cfg)
+		if err != nil {
+			fail(err)
+		}
+		s.ln = ln
+		_, port, _ := net.SplitHostPort(ln.Addr().String())
+		if *advertise == "" {
+			*advertise = advertiseIP()
+		}
+		l := fmt.Sprintf("collab-plan://%s/%s/%s", net.JoinHostPort(*advertise, port), tok, fp)
+		fmt.Printf("Send this to each peer, they paste it into their Claude session:\n\n%s\n\nwaiting for peers...\n", pastePrompt(l))
+		run = func() { s.serve(ln, tok) }
+	} else {
+		addr, tok, fp, err := parseLink(link)
+		if err != nil {
+			fail(err)
+		}
+		p, dec, err := dial(addr, tok, fp, *name)
+		if err != nil {
+			fail(err)
+		}
+		s.peers[p] = true
+		run = func() { s.readPeer(p, dec); s.end() }
+	}
+	go run()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() { <-sig; s.end() }()
+
 	go s.readInput(os.Stdin, *fifo == "")
 	if *fifo != "" {
 		if err := s.watchFifo(*fifo); err != nil {
-			fmt.Fprintln(os.Stderr, "error: fifo:", err)
-			os.Exit(1)
+			fail(fmt.Errorf("fifo: %w", err))
 		}
 		defer os.Remove(*fifo)
 	}
-	<-done
+	<-s.done
 	fmt.Println("session ended, tunnel closed")
-	if path, err := s.writeSummary(*out); err != nil {
-		fmt.Fprintln(os.Stderr, "error: summary:", err)
-		os.Exit(1)
-	} else {
-		fmt.Println("decisions written to", path)
+	path, err := s.writeSummary(*out)
+	if err != nil {
+		fail(fmt.Errorf("summary: %w", err))
 	}
+	fmt.Println("summary written to", path)
 }
 
 func defaultName() string {
@@ -200,35 +313,143 @@ func (s *session) writeSummary(path string) (string, error) {
 	for i, d := range s.decisions {
 		fmt.Fprintf(&b, "%d. %s (%s)\n", i+1, d.Text, d.From)
 	}
+	b.WriteString("\n## Transcript\n\n")
+	for _, e := range s.transcript {
+		fmt.Fprintf(&b, "- `%s` %s\n", e.at.Format("15:04:05"), e.line)
+	}
 	return path, os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
-func join(addr, tok string) (net.Conn, error) {
-	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
+// serverTLS makes a throwaway self-signed cert and a random join token.
+// Joiners pin the cert by SHA-256 fingerprint instead of using a CA.
+func serverTLS() (*tls.Config, string, string, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
-	io.WriteString(c, tok+"\n")
-	c.SetReadDeadline(time.Now().Add(10 * time.Second))
-	// Read byte-wise so no post-handshake data is buffered away.
-	var resp []byte
-	one := make([]byte, 1)
+	now := time.Now()
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "collab-plan"},
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, "", "", err
+	}
+	sum := sha256.Sum256(der)
+	tb := make([]byte, 8)
+	rand.Read(tb)
+	cfg := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+	}
+	return cfg, hex.EncodeToString(sum[:]), hex.EncodeToString(tb), nil
+}
+
+func (s *session) serve(ln net.Listener, tok string) {
 	for {
-		if _, err := c.Read(one); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("handshake failed (bad token?)")
+		c, err := ln.Accept()
+		if err != nil {
+			return
 		}
-		if one[0] == '\n' {
-			break
-		}
-		resp = append(resp, one[0])
+		go s.admit(c, tok)
 	}
-	c.SetReadDeadline(time.Time{})
-	if string(resp) != "ok" {
+}
+
+func (s *session) admit(c net.Conn, tok string) {
+	c.SetDeadline(time.Now().Add(10 * time.Second)) // also bounds the TLS handshake
+	dec := json.NewDecoder(c)
+	var h msg
+	if dec.Decode(&h) != nil || h.Kind != "hello" || strings.TrimSpace(h.From) == "" ||
+		subtle.ConstantTimeCompare([]byte(h.Text), []byte(tok)) != 1 {
 		c.Close()
-		return nil, fmt.Errorf("handshake rejected")
+		return
 	}
-	return c, nil
+	c.SetDeadline(time.Time{})
+	p := newPeer(c, h.From)
+	if p.send(msg{Kind: "hello", Text: "ok"}) != nil {
+		c.Close()
+		return
+	}
+	s.mu.Lock()
+	if s.ended() {
+		s.mu.Unlock()
+		c.Close()
+		return
+	}
+	s.peers[p] = true
+	s.mu.Unlock()
+	s.addPerson(p.name)
+	s.announce(p.name + " joined")
+
+	s.readPeer(p, dec)
+
+	s.mu.Lock()
+	delete(s.peers, p)
+	s.mu.Unlock()
+	c.Close()
+	if !s.ended() {
+		s.announce(p.name + " left")
+	}
+}
+
+func (s *session) announce(text string) {
+	m := msg{Kind: "sys", Text: text}
+	s.show(m)
+	s.broadcast(m, nil)
+}
+
+func dial(addr, tok, fp, name string) (*peer, *json.Decoder, error) {
+	cfg := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		// The cert is self-signed; trust is the fingerprint from the link.
+		InsecureSkipVerify: true,
+		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
+			if len(raw) == 0 {
+				return errors.New("host sent no certificate")
+			}
+			sum := sha256.Sum256(raw[0])
+			if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(fp)) != 1 {
+				return errors.New("host certificate does not match the link fingerprint")
+			}
+			return nil
+		},
+	}
+	c, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", addr, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	p := newPeer(c, "host")
+	if err := p.send(msg{Kind: "hello", From: name, Text: tok}); err != nil {
+		c.Close()
+		return nil, nil, err
+	}
+	dec := json.NewDecoder(c)
+	var r msg
+	if dec.Decode(&r) != nil || r.Kind != "hello" || r.Text != "ok" {
+		c.Close()
+		return nil, nil, errors.New("handshake rejected (bad token?)")
+	}
+	c.SetDeadline(time.Time{})
+	return p, dec, nil
+}
+
+func parseLink(link string) (addr, tok, fp string, err error) {
+	bad := fmt.Errorf("invalid link %q, want collab-plan://HOST:PORT/TOKEN/FINGERPRINT", link)
+	u, perr := url.Parse(strings.TrimSpace(link))
+	if perr != nil || u.Scheme != "collab-plan" || u.Host == "" {
+		return "", "", "", bad
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || len(parts[1]) != 64 {
+		return "", "", "", bad
+	}
+	return u.Host, parts[0], parts[1], nil
 }
 
 func (s *session) startAgent(command string) error {
@@ -252,25 +473,31 @@ func (s *session) startAgent(command string) error {
 		for sc.Scan() {
 			m := msg{Kind: "agent", From: s.name, Text: sc.Text()}
 			s.show(m)
-			if s.send(m) != nil {
-				return
-			}
+			s.broadcast(m, nil)
 		}
 	}()
 	return nil
 }
 
-func (s *session) readRemote() {
-	sc := bufio.NewScanner(s.conn)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
-	for sc.Scan() {
+// readPeer handles messages from one peer until its connection closes.
+func (s *session) readPeer(p *peer, dec *json.Decoder) {
+	for {
 		var m msg
-		if json.Unmarshal(sc.Bytes(), &m) != nil {
+		if dec.Decode(&m) != nil {
+			return
+		}
+		// Peers cannot inject system lines or spoof another sender.
+		if m.Kind == "hello" || (s.hub && m.Kind == "sys") {
 			continue
 		}
+		if s.hub {
+			m.From = p.name
+		}
 		s.show(m)
-		s.addPerson(m.From)
-		// Agents only see peer humans' chat, not peer agent output, to avoid loops.
+		if s.hub {
+			s.broadcast(m, p)
+		}
+		// Agents only see humans' chat, not other agents' output, to avoid loops.
 		if m.Kind == "chat" {
 			s.toAgent(fmt.Sprintf("[%s] %s", m.From, m.Text))
 		}
@@ -287,24 +514,25 @@ func (s *session) readInput(r io.Reader, closeOnEOF bool) {
 			continue
 		}
 		if t == "/quit" {
-			s.conn.Close()
+			s.end()
 			return
 		}
 		kind := "chat"
 		if d, ok := strings.CutPrefix(t, "/decide "); ok {
 			kind, t = "decision", strings.TrimSpace(d)
+			if t == "" {
+				continue
+			}
 		}
 		m := msg{Kind: kind, From: s.name, Text: t}
 		s.show(m)
 		if kind == "chat" {
 			s.toAgent(t)
 		}
-		if s.send(m) != nil {
-			return
-		}
+		s.broadcast(m, nil)
 	}
 	if closeOnEOF {
-		s.conn.Close()
+		s.end()
 	}
 }
 
@@ -322,16 +550,7 @@ func (s *session) watchFifo(path string) error {
 	return nil
 }
 
-func parseLink(link string) (addr, tok string, err error) {
-	u, err := url.Parse(strings.TrimSpace(link))
-	tok = strings.Trim(u.Path, "/")
-	if err != nil || u.Scheme != "collab-plan" || u.Host == "" || tok == "" {
-		return "", "", fmt.Errorf("invalid link %q, want collab-plan://HOST:PORT/TOKEN", link)
-	}
-	return u.Host, tok, nil
-}
-
-// runNext blocks until the log has new lines from the peer, prints them, and
+// runNext blocks until the log has new lines from others, prints them, and
 // exits. The read position is kept in <log>.cursor so each call returns only
 // unseen lines. It is meant to be run by an agent as a background task: the
 // task finishing is what wakes the agent up.
@@ -401,49 +620,14 @@ func advertiseIP() string {
 	return fallback
 }
 
-// pastePrompt is what the host sends; the peer pastes it into their Claude session.
+// pastePrompt is what the host sends; each peer pastes it into their Claude session.
 func pastePrompt(link string) string {
 	return fmt.Sprintf(`Join a collaborative planning session with me via the collab-plan CLI.
 1. Run in the background: collab-plan join %s -name <my name> -fifo /tmp/collab-plan.fifo -log /tmp/collab-plan.log
-2. To send my peer a message: echo "text" > /tmp/collab-plan.fifo
-3. Read my peer: run in the background: collab-plan next -log /tmp/collab-plan.log -name <my name>
-   It blocks until the peer sends something new, prints only the new lines, then exits. When it exits, read the output, reply if needed, and start it again. Keep exactly one running for the whole session.
+2. To send everyone a message: echo "text" > /tmp/collab-plan.fifo
+3. Read the others: run in the background: collab-plan next -log /tmp/collab-plan.log -name <my name>
+   It blocks until someone sends something new, prints only the new lines, then exits. When it exits, read the output, reply if needed, and start it again. Keep exactly one running for the whole session.
 4. When we agree on something, record it: echo "/decide <one-line decision>" > /tmp/collab-plan.fifo
-5. When I say we are done: echo "/quit" > /tmp/collab-plan.fifo. That closes the tunnel and writes the decisions markdown.
-Discuss and refine the plan with the peer's agent; keep me updated on what is agreed.`, link)
-}
-
-func host(listen, advertise string) (net.Conn, error) {
-	b := make([]byte, 8)
-	rand.Read(b)
-	tok := hex.EncodeToString(b)
-	ln, err := net.Listen("tcp", listen)
-	if err != nil {
-		return nil, err
-	}
-	defer ln.Close()
-	_, port, _ := net.SplitHostPort(ln.Addr().String())
-	if advertise == "" {
-		advertise = advertiseIP()
-	}
-	link := fmt.Sprintf("collab-plan://%s/%s", net.JoinHostPort(advertise, port), tok)
-	fmt.Printf("Send this to your peer, they paste it into their Claude session:\n\n%s\n\nwaiting for peer...\n", pastePrompt(link))
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			return nil, err
-		}
-		// Only the first peer that presents the token gets in.
-		c.SetReadDeadline(time.Now().Add(10 * time.Second))
-		line, err := bufio.NewReader(c).ReadString('\n')
-		got := strings.TrimSpace(line)
-		if err != nil || subtle.ConstantTimeCompare([]byte(got), []byte(tok)) != 1 {
-			c.Close()
-			continue
-		}
-		c.SetReadDeadline(time.Time{})
-		io.WriteString(c, "ok\n")
-		fmt.Println("peer connected")
-		return c, nil
-	}
+5. When I say we are done: echo "/quit" > /tmp/collab-plan.fifo. That leaves the session and writes the markdown summary.
+Discuss and refine the plan with the other agents; keep me updated on what is agreed.`, link)
 }
